@@ -1,0 +1,301 @@
+#!/usr/bin/env python3
+"""
+Flash-Worker - Cloudflare Workers Bulk Deployer
+Author: Antigravity AI
+Version: 1.0.0
+
+A high-performance Python script to deploy multiple Cloudflare Workers in bulk,
+concurrently, with automated config generation, validation, and cleanup.
+Only successfully deployed worker URLs are recorded in success_urls.txt.
+"""
+
+import os
+import sys
+import re
+import time
+import shutil
+import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
+
+# Terminal Colors for Rich Aesthetics
+class Colors:
+    HEADER = '\033[95m'
+    BLUE = '\033[94m'
+    CYAN = '\033[96m'
+    GREEN = '\033[92m'
+    WARNING = '\033[93m'
+    FAIL = '\033[91m'
+    ENDC = '\033[0m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
+
+# Thread-safe terminal printing and file writing locks
+print_lock = Lock()
+file_lock = Lock()
+
+def safe_print(message):
+    with print_lock:
+        print(message)
+        sys.stdout.flush()
+
+def append_success_url(url):
+    """Appends a successfully deployed URL to success_urls.txt in a thread-safe manner."""
+    with file_lock:
+        try:
+            # Check if file exists and has content, and ensure it ends with a newline
+            needs_newline = False
+            if os.path.exists("success_urls.txt") and os.path.getsize("success_urls.txt") > 0:
+                with open("success_urls.txt", "rb") as f:
+                    f.seek(-1, os.SEEK_END)
+                    last_char = f.read(1)
+                    if last_char != b'\n':
+                        needs_newline = True
+            
+            with open("success_urls.txt", "a") as f:
+                if needs_newline:
+                    f.write("\n")
+                f.write(f"{url}\n")
+        except Exception as e:
+            safe_print(f"{Colors.WARNING}[WARNING] Failed to append '{url}' to success_urls.txt: {str(e)}{Colors.ENDC}")
+
+def show_banner():
+    banner = f"""
+{Colors.CYAN}{Colors.BOLD}   ___ _           _      __      __           _             
+  / __\ | __ _ ___| |__   \ \    / /___  _ __ | | _____ _ __ 
+ / _\ | |/ _` / __| '_ \   \ \/\/ // _ \| '__|| |/ / _ \ '__|
+/ /   | | (_| \__ \ | | |   \  /\  / (_) | |   |   <  __/ |   
+\/    |_|\__,_|___/_| |_|    \/  \/ \___/|_|   |_|\_\___|_|   
+                                                             {Colors.ENDC}
+{Colors.BLUE}{Colors.BOLD}⚡ Bulk Deploy Cloudflare Workers Concurrently & Flawlessly ⚡{Colors.ENDC}
+"""
+    print(banner)
+
+def verify_environment():
+    """Verify worker.js and prerequisite tools (npx, wrangler) are present."""
+    safe_print(f"{Colors.BOLD}[*] Initializing system checks...{Colors.ENDC}")
+    
+    # 1. Check worker.js exists
+    if not os.path.exists("worker.js"):
+        safe_print(f"{Colors.FAIL}[ERROR] 'worker.js' not found in the current directory!{Colors.ENDC}")
+        safe_print("Please ensure your Worker script is saved as 'worker.js' in this folder.")
+        sys.exit(1)
+    safe_print(f"{Colors.GREEN}[✓] Found 'worker.js' successfully.{Colors.ENDC}")
+    
+    # 2. Check for npx/node
+    if not shutil.which("npx"):
+        safe_print(f"{Colors.FAIL}[ERROR] 'npx' is not installed or not in system PATH.{Colors.ENDC}")
+        safe_print("Please install Node.js (which includes npx) to run Wrangler.")
+        sys.exit(1)
+    safe_print(f"{Colors.GREEN}[✓] Node.js environment detected ('npx' available).{Colors.ENDC}")
+
+    # 3. Verify Wrangler is authenticated
+    safe_print(f"{Colors.BOLD}[*] Verifying Cloudflare authentication status...{Colors.ENDC}")
+    try:
+        # Run wrangler whoami to see if user is authenticated
+        result = subprocess.run(
+            ["npx", "wrangler", "whoami"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=15
+        )
+        if result.returncode != 0 or "No user logged in" in result.stdout or "Error" in result.stderr:
+            safe_print(f"\n{Colors.WARNING}[WARNING] You might not be logged into Cloudflare!{Colors.ENDC}")
+            safe_print("Please make sure to run 'npx wrangler login' first if the deployment fails.")
+        else:
+            safe_print(f"{Colors.GREEN}[✓] Cloudflare account verified.{Colors.ENDC}")
+    except Exception:
+        safe_print(f"{Colors.WARNING}[WARNING] Could not check Wrangler login status automatically. Proceeding anyway...{Colors.ENDC}")
+
+def deploy_single_worker(index, worker_name, compatibility_date):
+    """Deploys a single worker using a dynamically generated temporary wrangler config."""
+    temp_dir = ".flash_temp"
+    config_filename = f"wrangler_temp_{index}.toml"
+    config_path = os.path.join(temp_dir, config_filename)
+    
+    # Write a dynamic configuration file
+    # We reference "worker.js" by traversing up to the parent directory: "../worker.js"
+    config_content = f"""# Temporary config generated by Flash-Worker
+name = "{worker_name}"
+main = "../worker.js"
+compatibility_date = "{compatibility_date}"
+"""
+    try:
+        with open(config_path, "w") as f:
+            f.write(config_content)
+    except Exception as e:
+        return index, worker_name, False, None, f"Failed to create config file: {str(e)}"
+        
+    safe_print(f"{Colors.BLUE}[⚡ Thread-{index:02d}] Initiating deployment for '{worker_name}'...{Colors.ENDC}")
+    
+    start_time = time.time()
+    try:
+        # Execute deployment command
+        process = subprocess.run(
+            ["npx", "wrangler", "deploy", "--config", config_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=90  # 90 seconds timeout per worker deployment
+        )
+        
+        elapsed = time.time() - start_time
+        stdout = process.stdout
+        stderr = process.stderr
+        
+        # Cleanup config file as soon as the command returns
+        if os.path.exists(config_path):
+            os.remove(config_path)
+            
+        if process.returncode == 0:
+            # Parse deployed URL from stdout
+            url_match = re.search(r"https?://[a-zA-Z0-9-._]+\.workers\.dev", stdout)
+            deployed_url = url_match.group(0) if url_match else f"https://{worker_name}.unknown-subdomain.workers.dev (Failed to parse URL, but deployed)"
+            safe_print(f"{Colors.GREEN}[✓ Success] Deployed '{worker_name}' in {elapsed:.1f}s -> {deployed_url}{Colors.ENDC}")
+            append_success_url(deployed_url)
+            return index, worker_name, True, deployed_url, None
+        else:
+            # Format a compact error message
+            err_msg = stderr.strip().split("\n")[-1] if stderr.strip() else stdout.strip().split("\n")[-1]
+            if not err_msg:
+                err_msg = "Unknown deployment error"
+            safe_print(f"{Colors.FAIL}[✗ Failed] '{worker_name}' failed to deploy in {elapsed:.1f}s. Error: {err_msg}{Colors.ENDC}")
+            return index, worker_name, False, None, err_msg
+            
+    except subprocess.TimeoutExpired:
+        # Make sure file is removed
+        if os.path.exists(config_path):
+            os.remove(config_path)
+        safe_print(f"{Colors.FAIL}[✗ Timeout] '{worker_name}' exceeded 90 second limit and was terminated.{Colors.ENDC}")
+        return index, worker_name, False, None, "Deployment timed out (90s limit)"
+    except Exception as e:
+        if os.path.exists(config_path):
+            os.remove(config_path)
+        safe_print(f"{Colors.FAIL}[✗ Error] Exception deploying '{worker_name}': {str(e)}{Colors.ENDC}")
+        return index, worker_name, False, None, str(e)
+
+def main():
+    show_banner()
+    verify_environment()
+    
+    # Prompt the user for details
+    print(f"\n{Colors.BOLD}{Colors.HEADER}--- Configuration Parameters ---{Colors.ENDC}")
+    
+    # 1. Number of Workers
+    while True:
+        try:
+            count_input = input(f"{Colors.BOLD}Enter number of workers to deploy (e.g. 5, 10, 50): {Colors.ENDC}").strip()
+            num_workers = int(count_input)
+            if num_workers <= 0:
+                print(f"{Colors.WARNING}Please enter a number greater than 0.{Colors.ENDC}")
+                continue
+            break
+        except ValueError:
+            print(f"{Colors.WARNING}Invalid input. Please enter a valid number (e.g. 10).{Colors.ENDC}")
+            
+    # 2. Base Name
+    default_base = "flash-worker"
+    base_name_input = input(f"{Colors.BOLD}Enter base name for workers [default: {default_base}]: {Colors.ENDC}").strip()
+    base_name = base_name_input if base_name_input else default_base
+    # Clean base name for URL and wrangler standards (lower case, alphanumeric + hyphens)
+    base_name = re.sub(r'[^a-zA-Z0-9-]', '', base_name.lower().replace(" ", "-"))
+    if not base_name:
+        base_name = default_base
+
+    # 3. Compatibility Date
+    current_date = time.strftime("%Y-%m-%d")
+    comp_date_input = input(f"{Colors.BOLD}Enter Wrangler compatibility date [default: {current_date}]: {Colors.ENDC}").strip()
+    compatibility_date = comp_date_input if comp_date_input else current_date
+
+    # 4. Concurrency Limit
+    default_concurrency = 5
+    while True:
+        concurrency_input = input(f"{Colors.BOLD}Enter concurrency level (simultaneous uploads) [default: {default_concurrency}]: {Colors.ENDC}").strip()
+        if not concurrency_input:
+            concurrency = default_concurrency
+            break
+        try:
+            concurrency = int(concurrency_input)
+            if concurrency <= 0:
+                print(f"{Colors.WARNING}Concurrency must be at least 1.{Colors.ENDC}")
+                continue
+            break
+        except ValueError:
+            print(f"{Colors.WARNING}Invalid input. Please enter a number.{Colors.ENDC}")
+
+    print(f"\n{Colors.BOLD}{Colors.GREEN}🚀 Launching Flash-Worker Bulk Deployment...{Colors.ENDC}")
+    print(f"   -> Total Workers: {Colors.CYAN}{num_workers}{Colors.ENDC}")
+    print(f"   -> Base Name:     {Colors.CYAN}{base_name}-X{Colors.ENDC}")
+    print(f"   -> Concurrency:   {Colors.CYAN}{concurrency} workers at a time{Colors.ENDC}")
+    print(f"   -> Config Date:   {Colors.CYAN}{compatibility_date}{Colors.ENDC}")
+    print(f"----------------------------------------------------\n")
+
+    # Create temporary config directory
+    temp_dir = ".flash_temp"
+    shutil.rmtree(temp_dir, ignore_errors=True)
+    os.makedirs(temp_dir, exist_ok=True)
+
+    success_urls = []
+    failed_workers = []
+    
+    start_total_time = time.time()
+    
+    try:
+        # Run deployments concurrently
+        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+            futures = []
+            for i in range(1, num_workers + 1):
+                worker_name = f"{base_name}-{i}"
+                futures.append(
+                    executor.submit(deploy_single_worker, i, worker_name, compatibility_date)
+                )
+                
+            for future in as_completed(futures):
+                idx, w_name, success, url, err_msg = future.result()
+                if success:
+                    success_urls.append((w_name, url))
+                else:
+                    failed_workers.append((w_name, err_msg))
+                    
+    except KeyboardInterrupt:
+        safe_print(f"\n{Colors.FAIL}[!] Deployment interrupted by user! Initiating graceful exit and cleanup...{Colors.ENDC}")
+    finally:
+        # Always clean up the temporary configs directory
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+    total_duration = time.time() - start_total_time
+    success_count = len(success_urls)
+    failed_count = len(failed_workers)
+    
+    # URLs have already been appended to success_urls.txt on the go.
+    if success_count > 0:
+        url_file_status = f"{Colors.GREEN}[✓] URLs appended to success_urls.txt on the go{Colors.ENDC}"
+    else:
+        url_file_status = f"{Colors.WARNING}[!] No new success URLs to append.{Colors.ENDC}"
+
+    # Print Gorgeous Final Summary Table
+    border = "=" * 60
+    header_title = " FLASH-WORKER DEPLOYMENT SUMMARY "
+    padding_len = (60 - len(header_title)) // 2
+    header_str = "=" * padding_len + header_title + "=" * (60 - padding_len - len(header_title))
+    
+    print(f"\n{Colors.BOLD}{Colors.CYAN}{header_str}{Colors.ENDC}")
+    print(f" {Colors.BOLD}Total Processed:{Colors.ENDC}    {num_workers}")
+    print(f" {Colors.BOLD}Successfully Deployed:{Colors.ENDC} {Colors.GREEN}{success_count}{Colors.ENDC}")
+    print(f" {Colors.BOLD}Failed Deployments:{Colors.ENDC}    {Colors.FAIL if failed_count > 0 else Colors.GREEN}{failed_count}{Colors.ENDC}")
+    print(f" {Colors.BOLD}Success Rate:{Colors.ENDC}          {Colors.BOLD}{(success_count / num_workers) * 100:.1f}%{Colors.ENDC}")
+    print(f" {Colors.BOLD}Total Time Elapsed:{Colors.ENDC}    {total_duration:.2f} seconds")
+    print(f" {Colors.BOLD}Average Time/Worker:{Colors.ENDC}   {total_duration / num_workers:.2f} seconds")
+    print(f" {Colors.BOLD}Output Status:{Colors.ENDC}         {url_file_status}")
+    print(f"{Colors.BOLD}{Colors.CYAN}{border}{Colors.ENDC}")
+
+    # List failures if any occurred
+    if failed_count > 0:
+        print(f"\n{Colors.BOLD}{Colors.FAIL}--- Failed Deployments Log ---{Colors.ENDC}")
+        for w_name, err in failed_workers:
+            print(f" {Colors.FAIL}•{Colors.ENDC} {Colors.BOLD}{w_name}:{Colors.ENDC} {err}")
+        print(f"{Colors.BOLD}{Colors.FAIL}------------------------------{Colors.ENDC}")
+
+if __name__ == "__main__":
+    main()
