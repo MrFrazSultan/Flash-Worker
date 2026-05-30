@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Flash-Worker - Cloudflare Workers Bulk Deployer
-Author: Antigravity AI
+Author: Fraz
 Version: 1.0.0
 
 A high-performance Python script to deploy multiple Cloudflare Workers in bulk,
